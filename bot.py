@@ -228,21 +228,45 @@ async def run_prompt_in_channel(
                     tools_str = ", ".join(f"`{t}`" for t in event.tool_names)
                     tool_log.append(f"🔧 Running {tools_str}")
                     recent_log = "\n".join(tool_log[-5:])
-                    await status_msg.edit(
-                        content=f"🧠 *Antigravity is working (`{conv_id[:8]}...`)*\n{recent_log}"
-                    )
+                    try:
+                        await status_msg.edit(
+                            content=f"🧠 *Antigravity is working (`{conv_id[:8]}...`)*\n{recent_log}"
+                        )
+                    except Exception:
+                        pass
                 elif event.kind == "thinking" and event.text:
                     chunks = split_discord_message(event.text)
                     for chunk in chunks:
                         await target_channel.send(chunk)
+                elif event.kind == "interim" and event.text:
+                    # Interim progress message while subagent / background task is active
+                    chunks = split_discord_message(event.text)
+                    try:
+                        await status_msg.edit(content=chunks[0])
+                        for extra in chunks[1:]:
+                            await target_channel.send(extra)
+                    except Exception:
+                        for chunk in chunks:
+                            await target_channel.send(chunk)
+                    tool_log.clear()
+                    status_msg = await target_channel.send(
+                        f"⏳ *Antigravity: Subagent working in background (`{conv_id[:8]}...`)*"
+                    )
                 elif event.kind == "response":
                     chunks = split_discord_message(event.text)
-                    await status_msg.edit(content=chunks[0])
-                    for extra in chunks[1:]:
-                        await target_channel.send(extra)
+                    try:
+                        await status_msg.edit(content=chunks[0])
+                        for extra in chunks[1:]:
+                            await target_channel.send(extra)
+                    except Exception:
+                        for chunk in chunks:
+                            await target_channel.send(chunk)
                     return
                 elif event.kind == "error":
-                    await status_msg.edit(content=f"⚠️ {event.text}")
+                    try:
+                        await status_msg.edit(content=f"⚠️ {event.text}")
+                    except Exception:
+                        await target_channel.send(f"⚠️ {event.text}")
                     return
 
     except Exception as exc:

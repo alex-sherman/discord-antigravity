@@ -25,7 +25,7 @@ UUID_RE = re.compile(
 class AgentEvent:
     """Represents a live update from Antigravity while processing a turn."""
 
-    kind: str  # "thinking", "tool_call", "response", "error"
+    kind: str  # "thinking", "tool_call", "interim", "response", "error"
     text: str
     tool_names: List[str] = field(default_factory=list)
 
@@ -392,6 +392,7 @@ class DesktopAgentBridge:
             if not is_new_conversation
             else -1
         )
+        start_index = last_seen_index
 
         if not is_new_conversation:
             await self._run_agentapi(
@@ -402,11 +403,55 @@ class DesktopAgentBridge:
                 project_id=project_id,
             )
 
+        active_subagents: Dict[str, str] = {}  # subagent_id -> role/name
+        finished_subagents: Set[str] = set()
+        subagent_last_seen: Dict[str, int] = {}
+        pending_subagent_role: Optional[str] = None
+
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
 
         while loop.time() < deadline:
             await asyncio.sleep(poll_interval)
+
+            # 1. Check for newly spawned subagents in .system_generated/subagents
+            subagents_dir = self.brain_dir / conversation_id / ".system_generated" / "subagents"
+            if subagents_dir.exists():
+                for sub_json_path in subagents_dir.glob("*.json"):
+                    try:
+                        data = json.loads(sub_json_path.read_text(encoding="utf-8", errors="replace"))
+                        cid = data.get("conversationId")
+                        spawn_idx = data.get("spawnStepIndex", -1)
+                        if cid and spawn_idx > start_index and cid not in finished_subagents:
+                            desc = (
+                                data.get("subagentDescriptor", {}).get("role")
+                                or data.get("subagentDescriptor", {}).get("typeName")
+                                or "subagent"
+                            )
+                            if cid not in active_subagents:
+                                active_subagents[cid] = desc
+                                subagent_last_seen[cid] = -1
+                    except Exception:
+                        pass
+
+            # 2. Stream tool activity from active subagents
+            for sub_id, desc in list(active_subagents.items()):
+                sub_steps = self.read_steps(sub_id)
+                last_seen = subagent_last_seen.get(sub_id, -1)
+                new_sub_steps = [s for s in sub_steps if s.get("step_index", -1) > last_seen]
+                for sstep in new_sub_steps:
+                    subagent_last_seen[sub_id] = max(last_seen, sstep.get("step_index", -1))
+                    if sstep.get("source") == "MODEL" and sstep.get("type") == "PLANNER_RESPONSE":
+                        sub_tcs = sstep.get("tool_calls") or []
+                        if sub_tcs:
+                            sub_tool_names = [tc.get("name", "tool") for tc in sub_tcs]
+                            yield AgentEvent(
+                                kind="tool_call",
+                                text=f"[{desc}] Running {', '.join(sub_tool_names)}",
+                                tool_names=sub_tool_names,
+                            )
+
+            # 3. Read new steps from the parent conversation
             steps = self.read_steps(conversation_id)
             new_steps = [
                 s for s in steps if s.get("step_index", -1) > last_seen_index
@@ -418,12 +463,37 @@ class DesktopAgentBridge:
                 last_seen_index = max(last_seen_index, step.get("step_index", -1))
                 source = step.get("source")
                 step_type = step.get("type")
+                content = (step.get("content") or "").strip()
+                thinking = (step.get("thinking") or "").strip()
+                tool_calls = step.get("tool_calls") or []
+
+                # Detect invoke_subagent tool call
+                if tool_calls:
+                    for tc in tool_calls:
+                        if tc.get("name") == "invoke_subagent":
+                            args = tc.get("args") or {}
+                            pending_subagent_role = (
+                                args.get("Role") or args.get("TypeName") or "subagent"
+                            )
+
+                # Detect subagent ID from generic tool execution output
+                if source == "MODEL" and step_type == "GENERIC" and "Created the following subagent:" in content:
+                    m = re.search(r'"conversationId":\s*"([0-9a-fA-F-]+)"', content)
+                    if m:
+                        sub_id = m.group(1)
+                        if sub_id not in finished_subagents:
+                            active_subagents[sub_id] = pending_subagent_role or "subagent"
+                            subagent_last_seen[sub_id] = -1
+                            pending_subagent_role = None
+
+                # Detect subagent completion message to parent
+                if source == "SYSTEM" and step_type == "SYSTEM_MESSAGE":
+                    m = re.search(r"sender=([0-9a-fA-F-]+)", content)
+                    if m and m.group(1) in active_subagents:
+                        finished_subagents.add(m.group(1))
+                        active_subagents.pop(m.group(1), None)
 
                 if source == "MODEL" and step_type == "PLANNER_RESPONSE":
-                    tool_calls = step.get("tool_calls") or []
-                    content = (step.get("content") or "").strip()
-                    thinking = (step.get("thinking") or "").strip()
-
                     if tool_calls:
                         names = [tc.get("name", "tool") for tc in tool_calls]
                         yield AgentEvent(
@@ -432,11 +502,16 @@ class DesktopAgentBridge:
                             tool_names=names,
                         )
                         if content:
-                            # Intermediate message before tool execution
                             yield AgentEvent(kind="thinking", text=content)
                     elif content:
-                        yield AgentEvent(kind="response", text=content)
-                        return
+                        if active_subagents:
+                            # Subagents are still active: this is an interim status update!
+                            yield AgentEvent(kind="interim", text=content)
+                            # Keep listening for subagents to complete and parent to finish
+                        else:
+                            # All subagents complete and no more tools: final response!
+                            yield AgentEvent(kind="response", text=content)
+                            return
 
         yield AgentEvent(
             kind="error",
