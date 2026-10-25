@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+channel_map.json
+
+# IDE & Editor
+.vscode/
+.idea/
+
+# OS files
+Thumbs.db
+.DS_Store
